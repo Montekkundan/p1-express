@@ -7,9 +7,10 @@ const { Server } = require("socket.io");
 const cors = require('cors')
 const fs = require('fs');
 const { Readable } = require('stream');
-const {S3Client, PutObjectCommand} = require('@aws-sdk/client-s3')
+const {S3Client, PutObjectCommand, DeleteObjectCommand} = require('@aws-sdk/client-s3')
 const OpenAI = require("openai")
 const path = require('path')
+const {CloudFrontClient, CreateInvalidationCommand} = require("@aws-sdk/client-cloudfront");
 
 const dotenv = require('dotenv')
 
@@ -29,10 +30,20 @@ const s3 = new S3Client({
     region: process.env.BUCKET_REGION
 })
 
+const cloudFront = new CloudFrontClient({
+    credentials: {
+        accessKeyId: process.env.ACCESS_KEY,
+        secretAccessKey: process.env.SECRET_KEY
+    },
+    region: process.env.BUCKET_REGION
+});
+
 const io = new Server(server, {
     cors: {
-        origin: process.env.ELECTRON_HOST,
-        methods: ['GET', 'POST']
+        origin: process.env.NODE_ENV === 'development' 
+            ? [process.env.ELECTRON_HOST, 'http://localhost:3000']
+            : [process.env.ELECTRON_HOST, process.env.NEXT_WEB_HOST],
+        methods: ['GET', 'POST', 'DELETE']
     }
 });
 
@@ -139,7 +150,41 @@ io.on('connection', (socket) => {
         recordedChunks = []
         console.log(socket.id + " " + "disconnected")
     })
+    socket.on('delete-video', async (data) => {
+        try {
+            const { filename, videoId } = data;
+
+            // Delete from S3
+            const deleteCommand = new DeleteObjectCommand({
+                Bucket: process.env.BUCKET_NAME,
+                Key: filename
+            });
+
+            await s3.send(deleteCommand);
+
+            // Create CloudFront invalidation
+            const invalidationCommand = new CreateInvalidationCommand({
+                DistributionId: process.env.CLOUDFRONT_DISTRIBUTION_ID,
+                InvalidationBatch: {
+                    CallerReference: `${filename}-${Date.now()}`,
+                    Paths: {
+                        Quantity: 1,
+                        Items: [`/${filename}`]
+                    }
+                }
+            });
+
+            await cloudFront.send(invalidationCommand);
+
+            // Emit success back to client
+            socket.emit('video-deleted', { success: true });
+
+        } catch (error) {
+            console.error('Error deleting video:', error);
+            socket.emit('video-deleted', { success: false, error: error.message });
+        }
+    });
 })
 
 
-server.listen(5000, () => console.log('listening to port 5000'))
+server.listen(5001, () => console.log('listening to port 5001'))
